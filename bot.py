@@ -921,8 +921,8 @@ def confirm_track(chat_id: int) -> None:
 		send_message(chat_id, "Выбор не найден или устарел. Отправь трек заново.")
 		return
 	send_chat_action(chat_id, "upload_document")
-	sent_chat_id = send_audio_to_wedding_group(pending)
-	send_message(chat_id, f"Готово, трек отправлен в свадебную группу ({sent_chat_id}).")
+	send_audio_to_wedding_group(pending)
+	send_message(chat_id, "Готово, трек отправлен в свадебную группу.")
 	del PENDING_CONFIRM_BY_CHAT[chat_id]
 	cleanup_pending_file(pending)
 
