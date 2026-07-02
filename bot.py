@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -97,6 +98,7 @@ class PendingConfirmation:
 	requester_name: str
 	requester_username: str
 	requester_id: int
+	audio_path: str
 	created_at: float
 
 
@@ -187,14 +189,24 @@ def bot_token() -> str:
 	return token
 
 
-def wedding_group_chat_id() -> int:
+def wedding_group_chat_ids() -> List[int]:
 	value = os.environ.get("WEDDING_GROUP_CHAT_ID", "").strip()
 	if not value:
 		raise RuntimeError("Set WEDDING_GROUP_CHAT_ID to the target Telegram group chat id.")
 	try:
-		return int(value)
+		chat_id = int(value)
 	except ValueError as exc:
 		raise RuntimeError("WEDDING_GROUP_CHAT_ID must be an integer chat id.") from exc
+	ids = [chat_id]
+	if chat_id > 0:
+		ids.append(-int(f"100{chat_id}"))
+		ids.append(-chat_id)
+	seen = set()
+	return [item for item in ids if not (item in seen or seen.add(item))]
+
+
+def wedding_group_chat_id() -> int:
+	return wedding_group_chat_ids()[0]
 
 
 def session() -> requests.Session:
@@ -247,10 +259,18 @@ def api_url(method: str) -> str:
 def api_call(method: str, *, data=None, files=None, timeout: int = 60) -> Dict:
 	try:
 		resp = HTTP.post(api_url(method), data=data, files=files, timeout=timeout)
-		resp.raise_for_status()
 	except requests.RequestException as exc:
 		raise TelegramApiError(f"Telegram API error in {method}: {sanitize_error_message(exc)}") from exc
-	payload = resp.json()
+	try:
+		payload = resp.json()
+	except ValueError:
+		payload = {}
+	if resp.status_code >= 400:
+		detail = json.dumps(payload, ensure_ascii=False) if payload else resp.text.strip()
+		raise TelegramApiError(
+			f"Telegram API error in {method}: HTTP {resp.status_code} {resp.reason}; "
+			f"{sanitize_error_message(Exception(detail[:700]))}"
+		)
 	if not payload.get("ok"):
 		raise TelegramApiError(f"Telegram API error in {method}: {payload}")
 	return payload["result"]
@@ -726,6 +746,46 @@ def store_confirmation(chat_id: int, pending: PendingConfirmation) -> None:
 	send_message(chat_id, format_confirmation_text(pending.title, pending.artist), reply_markup=confirmation_buttons())
 
 
+def download_cache_dir() -> pathlib.Path:
+	return pathlib.Path(__file__).resolve().parent / "downloads"
+
+
+def cleanup_pending_file(pending: PendingConfirmation) -> None:
+	path = pathlib.Path(pending.audio_path)
+	parent = path.parent
+	try:
+		if parent.exists() and parent.parent == download_cache_dir():
+			shutil.rmtree(parent)
+		elif path.exists():
+			path.unlink()
+	except Exception as exc:
+		print(f"Could not remove cached audio {path}: {exc}", file=sys.stderr)
+
+
+def replace_pending_confirmation(chat_id: int, pending: PendingConfirmation) -> None:
+	old_pending = PENDING_CONFIRM_BY_CHAT.pop(chat_id, None)
+	if old_pending:
+		cleanup_pending_file(old_pending)
+	store_confirmation(chat_id, pending)
+
+
+def download_send_and_confirm(chat_id: int, pending: PendingConfirmation) -> None:
+	send_message(chat_id, f"Скачиваю: {pending.artist} - {pending.title}")
+	send_chat_action(chat_id, "upload_document")
+	out_dir = download_cache_dir() / f"{chat_id}-{int(time.time())}"
+	try:
+		output_file = download_audio(pending.video_id, pending.title, pending.artist, out_dir)
+		cover_bytes = yt_thumbnail_bytes(pending.video_id)
+		tag_file(output_file, pending.title, pending.artist, cover_bytes)
+		send_audio(chat_id, output_file, pending.title, pending.artist, cover_bytes)
+		pending.audio_path = str(output_file)
+		replace_pending_confirmation(chat_id, pending)
+	except Exception:
+		if out_dir.exists():
+			shutil.rmtree(out_dir, ignore_errors=True)
+		raise
+
+
 def format_candidates(candidates: List[Dict], limit: int = 5) -> str:
 	lines = ["Выбери вариант кнопкой ниже или отправь номер 1-5:"]
 	for index, candidate in enumerate(candidates[:limit], start=1):
@@ -754,7 +814,8 @@ def cleanup_old_pending() -> None:
 			del PENDING_CHOICES_BY_CHAT[chat_id]
 	for chat_id in list(PENDING_CONFIRM_BY_CHAT.keys()):
 		if now - PENDING_CONFIRM_BY_CHAT[chat_id].created_at > 1800:
-			del PENDING_CONFIRM_BY_CHAT[chat_id]
+			pending = PENDING_CONFIRM_BY_CHAT.pop(chat_id)
+			cleanup_pending_file(pending)
 
 
 def handle_search(chat_id: int, user: Dict, query: str) -> None:
@@ -764,7 +825,9 @@ def handle_search(chat_id: int, user: Dict, query: str) -> None:
 		send_message(chat_id, f"Не нашел варианты для: {query}")
 		return
 	PENDING_CHOICES_BY_CHAT[chat_id] = PendingChoice(query=query, candidates=ranked[:5], created_at=time.time())
-	PENDING_CONFIRM_BY_CHAT.pop(chat_id, None)
+	old_pending = PENDING_CONFIRM_BY_CHAT.pop(chat_id, None)
+	if old_pending:
+		cleanup_pending_file(old_pending)
 	prefix = f"Лучшее совпадение: {confidence:.2f}\n" if confidence > 0 else ""
 	send_message(chat_id, prefix + format_candidates(ranked, limit=5), reply_markup=candidate_buttons(ranked, limit=5))
 
@@ -791,7 +854,7 @@ def select_candidate(chat_id: int, user: Dict, index_text: str) -> None:
 	title, artist = candidate_track_metadata(selected)
 	if title == "Unknown title":
 		title = pending.query
-	store_confirmation(
+	download_send_and_confirm(
 		chat_id,
 		PendingConfirmation(
 			video_id=video_id,
@@ -801,6 +864,7 @@ def select_candidate(chat_id: int, user: Dict, index_text: str) -> None:
 			requester_name=requester_name(user),
 			requester_username=str(user.get("username") or "").strip(),
 			requester_id=int(user.get("id") or 0),
+			audio_path="",
 			created_at=time.time(),
 		),
 	)
@@ -813,7 +877,7 @@ def handle_direct_link(chat_id: int, user: Dict, url: str) -> None:
 		return
 	send_chat_action(chat_id, "typing")
 	title, artist = probe_video_metadata(url, video_id)
-	store_confirmation(
+	download_send_and_confirm(
 		chat_id,
 		PendingConfirmation(
 			video_id=video_id,
@@ -823,9 +887,32 @@ def handle_direct_link(chat_id: int, user: Dict, url: str) -> None:
 			requester_name=requester_name(user),
 			requester_username=str(user.get("username") or "").strip(),
 			requester_id=int(user.get("id") or 0),
+			audio_path="",
 			created_at=time.time(),
 		),
 	)
+
+
+def send_audio_to_wedding_group(pending: PendingConfirmation) -> int:
+	path = pathlib.Path(pending.audio_path)
+	if not path.exists():
+		raise RuntimeError("Cached audio file was not found. Send the track again.")
+	cover_bytes = yt_thumbnail_bytes(pending.video_id)
+	last_error: Optional[Exception] = None
+	for chat_id in wedding_group_chat_ids():
+		try:
+			send_audio(
+				chat_id,
+				path,
+				pending.title,
+				pending.artist,
+				cover_bytes,
+				caption=requester_caption(pending),
+			)
+			return chat_id
+		except TelegramApiError as exc:
+			last_error = exc
+	raise RuntimeError(f"Could not send audio to wedding group: {last_error}")
 
 
 def confirm_track(chat_id: int) -> None:
@@ -833,35 +920,23 @@ def confirm_track(chat_id: int) -> None:
 	if not pending:
 		send_message(chat_id, "Выбор не найден или устарел. Отправь трек заново.")
 		return
-	send_message(chat_id, f"Скачиваю: {pending.artist} - {pending.title}")
 	send_chat_action(chat_id, "upload_document")
-
-	with tempfile.TemporaryDirectory(prefix="weddingmusic-") as tmpdir:
-		tmp_path = pathlib.Path(tmpdir)
-		output_file = download_audio(pending.video_id, pending.title, pending.artist, tmp_path)
-		cover_bytes = yt_thumbnail_bytes(pending.video_id)
-		tag_file(output_file, pending.title, pending.artist, cover_bytes)
-		send_audio(chat_id, output_file, pending.title, pending.artist, cover_bytes)
-		send_audio(
-			wedding_group_chat_id(),
-			output_file,
-			pending.title,
-			pending.artist,
-			cover_bytes,
-			caption=requester_caption(pending),
-		)
-	send_message(chat_id, "Готово, трек отправлен в свадебную группу.")
+	sent_chat_id = send_audio_to_wedding_group(pending)
+	send_message(chat_id, f"Готово, трек отправлен в свадебную группу ({sent_chat_id}).")
 	del PENDING_CONFIRM_BY_CHAT[chat_id]
+	cleanup_pending_file(pending)
 
 
 def cancel_confirmation(chat_id: int) -> None:
-	PENDING_CONFIRM_BY_CHAT.pop(chat_id, None)
+	pending = PENDING_CONFIRM_BY_CHAT.pop(chat_id, None)
+	if pending:
+		cleanup_pending_file(pending)
 	send_message(chat_id, "Ок, выбор отменен.")
 
 
 def build_status_text() -> str:
 	try:
-		group = str(wedding_group_chat_id())
+		group = ", ".join(str(item) for item in wedding_group_chat_ids())
 	except Exception as exc:
 		group = f"error: {exc}"
 	return "\n".join([
