@@ -568,10 +568,15 @@ def extract_youtube_video_id(url: str) -> Optional[str]:
 
 
 def ytdlp_path() -> str:
-	root = pathlib.Path(__file__).resolve().parent.parent
-	local = root / "yt-dlp"
-	if local.exists():
-		return str(local)
+	app_dir = pathlib.Path(__file__).resolve().parent
+	candidates = [
+		app_dir.parent / "yt-dlp",
+		app_dir / ".venv" / "bin" / "yt-dlp",
+		pathlib.Path(sys.executable).resolve().parent / "yt-dlp",
+	]
+	for candidate in candidates:
+		if candidate.exists():
+			return str(candidate)
 	return "yt-dlp"
 
 
